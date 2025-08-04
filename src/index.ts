@@ -4,7 +4,6 @@ import { Argv, Command, Computed, Context, Schema, Session } from 'koishi'
 declare module 'koishi' {
   namespace Command {
     interface Config {
-      limitScope?: Computed<'user' | 'channel' | 'global'>
       maxUsage?: Computed<number>
       minInterval?: Computed<number>
     }
@@ -28,8 +27,9 @@ interface FilterRule {
 
 // 插件主配置项
 export interface Config {
+  scope?: 'user' | 'channel' | 'global'
+  sendHint?: boolean
   limitMiddleware?: boolean
-  middlewareScope?: 'user' | 'channel' | 'global'
   maxMiddlewareUsage?: number
   minMiddlewareInterval?: number
   defaultAction?: 'limit' | 'ignore'
@@ -54,14 +54,16 @@ export const name = 'rate-limit'
 
 // 配置项 Schema
 export const Config: Schema<Config> = Schema.object({
-  limitMiddleware: Schema.boolean().default(false).description('开启中间件频率限制'),
-  middlewareScope: Schema.union([
+  scope: Schema.union([
     Schema.const('user').description('用户'),
     Schema.const('channel').description('频道'),
     Schema.const('global').description('全局'),
   ]).default('user').description('频率限制范围'),
-  maxMiddlewareUsage: Schema.number().default(0).description('每日次数限制'),
+  sendHint: Schema.boolean().default(true).description('发送提示信息'),
+  limitMiddleware: Schema.boolean().default(false).description('限制中间件频率'),
+  maxMiddlewareUsage: Schema.number().default(0).description('每日调用次数'),
   minMiddlewareInterval: Schema.number().default(0).description('连续调用间隔（秒）'),
+
   defaultAction: Schema.union([
       Schema.const('limit').description('限制'),
       Schema.const('ignore').description('豁免'),
@@ -79,48 +81,70 @@ export const Config: Schema<Config> = Schema.object({
     type: Schema.union([
       Schema.const('user').description('用户ID'),
       Schema.const('channel').description('频道ID'),
-      Schema.const('keyword').description('关键词'),
-    ]).default('user').description('类型'),
-    content: Schema.string().required().description('内容'),
-  })).role('table').description('限流规则列表'),
+      Schema.const('keyword').description('关键词（仅限中间件）'),
+    ]).default('user').description('匹配类型'),
+    content: Schema.string().required().description('匹配内容'),
+  })).role('table').description('规则列表'),
 })
 
 export function apply(ctx: Context, config: Config) {
-  const records = new Map<string, Map<string, UsageRecord>>()
+  const commandRecords = new Map<string, Map<string, UsageRecord>>()
+  const middlewareRecords = new Map<string, Map<string, UsageRecord>>()
 
-  // 扩展 command schema
+  const commandRules = config.rules?.filter(rule => rule.applyTo === 'command' || rule.applyTo === 'both') || []
+  const middlewareRules = config.rules?.filter(rule => rule.applyTo === 'middleware' || rule.applyTo === 'both') || []
+
   ctx.schema.extend('command', Schema.object({
-    limitScope: Schema.computed(Schema.union(['user', 'channel', 'global'])).default('user').description('频率限制范围'),
     maxUsage: Schema.computed(Schema.number()).default(0).description('每日次数限制'),
-    minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔（秒）'),
+    minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔'),
   }), 800)
 
-  // 核心检查函数
-  function check(options: {
+  function shouldApplyLimit(session: Session, rules: FilterRule[], context: 'command' | 'middleware'): boolean {
+    const isMatch = (rule: FilterRule): boolean => {
+      switch (rule.type) {
+        case 'user': return rule.content === session.userId
+        case 'channel': return rule.content === session.channelId
+        case 'keyword': return context === 'middleware' && session.content?.includes(rule.content)
+        default: return false
+      }
+    }
+    const matchedRule = rules.find(isMatch)
+    return matchedRule ? matchedRule.action === 'limit' : config.defaultAction === 'limit'
+  }
+
+  /**
+   * 核心检查函数，处理冷却和使用次数
+   * @returns 若被限流则返回提示字符串，否则返回 undefined
+   */
+  function checkRateLimit(
+    records: Map<string, Map<string, UsageRecord>>,
     session: Session,
     scope: 'user' | 'channel' | 'global',
     name: string,
     minInterval: number,
     maxUsage: number
-  }): string | undefined {
-    const { session, scope, name, minInterval, maxUsage } = options
+  ): string | undefined {
     if (!minInterval && !maxUsage) return
 
-    const recordId = scope === 'user' ? `user:${session.userId}`
-      : scope === 'channel' ? `channel:${session.channelId}`
-      : 'global'
-
-    if (!recordId || (scope !== 'global' && !recordId.split(':')[1])) return
+    const recordId = scope === 'global' ? 'global' : `${scope}:${scope === 'user' ? session.userId : session.channelId}`
+    if (scope !== 'global' && !recordId.split(':')[1]) return
 
     const now = Date.now()
-    let commandRecords = records.get(recordId)
-    if (!commandRecords) records.set(recordId, commandRecords = new Map())
+    let userOrChannelRecords = records.get(recordId)
+    if (!userOrChannelRecords) {
+      userOrChannelRecords = new Map()
+      records.set(recordId, userOrChannelRecords)
+    }
 
-    let record = commandRecords.get(name)
-    if (!record) commandRecords.set(name, record = {})
+    let record = userOrChannelRecords.get(name)
+    if (!record) {
+      record = {}
+      userOrChannelRecords.set(name, record)
+    }
 
     if (minInterval > 0 && record.cooldownExpiresAt && now < record.cooldownExpiresAt) {
-      return ''
+      const remaining = Math.ceil((record.cooldownExpiresAt - now) / 1000)
+      return `操作过于频繁，请在 ${remaining} 秒后重试`
     }
 
     if (maxUsage > 0) {
@@ -131,7 +155,7 @@ export function apply(ctx: Context, config: Config) {
         record.dailyResetAt = tomorrow.getTime()
       }
       if (record.dailyUsesLeft <= 0) {
-        return ''
+        return `今日使用次数已达上限`
       }
     }
 
@@ -139,66 +163,30 @@ export function apply(ctx: Context, config: Config) {
     if (maxUsage > 0) record.dailyUsesLeft--
   }
 
-  // 检查会话是否匹配规则的函数
-  function shouldApplyLimit(session: Session, context: 'command' | 'middleware'): boolean {
-    const relevantRules = config.rules?.filter(rule => rule.applyTo === context || rule.applyTo === 'both') || []
-
-    const isMatch = (rule: FilterRule): boolean => {
-      if (rule.type === 'user' && rule.content === session.userId) return true
-      if (rule.type === 'channel' && rule.content === session.channelId) return true
-      if (context === 'middleware' && rule.type === 'keyword' && session.content?.includes(rule.content)) return true
-      return false
-    }
-
-    const matchedRule = relevantRules.find(isMatch)
-
-    if (matchedRule) {
-      return matchedRule.action === 'limit' // 如果匹配到规则，根据规则的 action 决定
-    }
-
-    return config.defaultAction === 'limit' // 如果未匹配到任何规则，根据默认行为决定
-  }
-
-  /**
-   * 统一的限流处理函数
-   * @param session 当前会话
-   * @param context 'command' 或 'middleware'
-   * @param command (可选) 当前指令对象
-   * @returns 如果需要拦截，则返回空字符串；否则返回 undefined
-   */
-  function rateLimit(session: Session, context: 'command' | 'middleware', command?: Command): string | undefined {
-    if (!shouldApplyLimit(session, context)) return
-
-    // 根据上下文准备 check 函数所需的参数
-    const options = context === 'command' && command
-      ? {
-        session,
-        scope: session.resolve(command.config.limitScope),
-        name: command.name.replace(/\./g, ':'),
-        minInterval: session.resolve(command.config.minInterval),
-        maxUsage: session.resolve(command.config.maxUsage),
-      }
-      : {
-        session,
-        scope: config.middlewareScope,
-        name: 'middleware',
-        minInterval: config.minMiddlewareInterval,
-        maxUsage: config.maxMiddlewareUsage,
-      }
-
-    return check(options)
-  }
-
-  // 拦截指令执行
   ctx.before('command/execute', ({ session, command }: Argv) => {
-    return rateLimit(session, 'command', command)
+    if (!shouldApplyLimit(session, commandRules, 'command')) return
+
+    const minInterval = session.resolve(command.config.minInterval)
+    const maxUsage = session.resolve(command.config.maxUsage)
+    const name = command.name.replace(/\./g, ':')
+
+    const result = checkRateLimit(commandRecords, session, config.scope, name, minInterval, maxUsage)
+
+    if (result) {
+      return config.sendHint ? result : ''
+    }
   })
 
-  // 拦截中间件触发
   ctx.middleware((session, next) => {
     if (!config.limitMiddleware || session.argv) return next()
+    if (!shouldApplyLimit(session, middlewareRules, 'middleware')) return next()
 
-    const result = rateLimit(session, 'middleware')
-    return result === undefined ? next() : result
+    const result = checkRateLimit(middlewareRecords, session, config.scope, 'middleware', config.minMiddlewareInterval, config.maxMiddlewareUsage)
+
+    if (result === undefined) {
+      return next()
+    } else {
+      return config.sendHint ? result : ''
+    }
   }, true)
 }
