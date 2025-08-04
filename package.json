@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-limit-rate",
-  "description": "限制指令执行频率和次数",
+  "description": "限制指令和中间件的调用频率和每日调用次数",
   "version": "0.0.1",
   "contributors": [
     "Yis_Rime <yis_rime@outlook.com>"
