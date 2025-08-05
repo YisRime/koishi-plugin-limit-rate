@@ -187,19 +187,21 @@ export function apply(ctx: Context, config: Config) {
   })
 
   // 中间件处理
-  ctx.middleware((session, next) => {
-    if (!config.limitMiddleware || !compiledMiddlewareRules.length || session.argv || !session.content) return next()
+  if (config.limitMiddleware) {
+    ctx.middleware((session, next) => {
+      if (!compiledMiddlewareRules.length || session.argv || !session.content) return next()
 
-    for (let i = 0; i < compiledMiddlewareRules.length; i++) {
-      const rule = compiledMiddlewareRules[i]
-      if (rule.regex.test(session.content)) {
-        const result = checkRateLimit(middlewareRecords, session, config.scope, `middleware-rule:${i}`, rule.minInterval, rule.maxUsage)
-        if (result !== undefined) {
-          // 一旦被任何一个规则限流，立即返回结果
-          return config.sendHint ? result : ''
+      for (let i = 0; i < compiledMiddlewareRules.length; i++) {
+        const rule = compiledMiddlewareRules[i]
+        if (rule.regex.test(session.content)) {
+          const result = checkRateLimit(middlewareRecords, session, config.scope, `middleware-rule:${i}`, rule.minInterval, rule.maxUsage)
+          if (result !== undefined) {
+            // 一旦被任何一个规则限流，立即返回结果
+            return config.sendHint ? result : ''
+          }
         }
       }
-    }
-    return next()
-  }, true)
+      return next()
+    }, true)
+  }
 }
